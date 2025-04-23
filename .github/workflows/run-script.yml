@@ -25,4 +25,4 @@ jobs:
           BLOB_CONNECTION_STRING: ${{ secrets.BLOB_CONNECTION_STRING }}
           BEARER_TOKEN: ${{ secrets.BEARER_TOKEN }}
           VERSION_ID: ${{ secrets.VERSION_ID }}
-        run: python topicsAnalytics.py
+        run: python function_app.py
