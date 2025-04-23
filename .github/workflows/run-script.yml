@@ -1,7 +1,9 @@
 name: Run Topic Analytics
 
 on:
-  workflow_dispatch:  # pour lancer manuellement
+  schedule:
+    - cron: '0 6 * * *'  # Tous les jours à 9h UTC
+  workflow_dispatch:     # Permet aussi de le lancer manuellement depuis GitHub
 
 jobs:
   run-script:

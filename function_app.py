@@ -260,7 +260,7 @@ def topicsAnalytics():
     try:
         df_topics = fetch_all_topics()
         df_enriched = add_referential_topics(df_topics, df_ref)
-        df_filtered = df_enriched[df_enriched['technicalName'].str.endswith('ini')].head(30)
+        df_filtered = df_enriched[df_enriched['technicalName'].str.endswith('ini')]
         df_final = generate_final_output_df(df_filtered)
     except Exception as err:
         logging.error(f"Processing error: {err}")
