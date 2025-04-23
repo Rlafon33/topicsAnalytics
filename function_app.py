@@ -9,7 +9,7 @@ import pandas as pd
 import requests
 from azure.storage.blob import BlobServiceClient
 
-app = func.FunctionApp()
+
 # --- Constants & Configuration ---
 ENV_BLOB_CONN = "BLOB_CONNECTION_STRING"
 ENV_BEARER     = "BEARER_TOKEN"
@@ -283,7 +283,6 @@ def generate_final_output_df(df: pd.DataFrame) -> pd.DataFrame:
 
     return df_out
 
-@app.route(route="topicsAnalytics", methods=["GET"])
 def topicsAnalytics(req: func.HttpRequest) -> func.HttpResponse:
     """Trigger HTTP to build and upload enriched topics CSV."""
     logging.info("Starting topic analytics.")
