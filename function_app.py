@@ -269,7 +269,7 @@ def generate_final_output_df(df: pd.DataFrame) -> pd.DataFrame:
         * 100
     ).fillna(0)
 
-    # Class labels
+    # Class labels 
     bins = [0, 0.000001, 80, 100, float('inf')]
     labels = [
         '0-Lineage fonctionnel & aligné au MOM inexistant',
