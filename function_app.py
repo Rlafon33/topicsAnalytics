@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import time
 from datetime import datetime
 from io import BytesIO, StringIO
 
@@ -9,18 +10,21 @@ import requests
 from azure.storage.blob import BlobServiceClient
 from dotenv import load_dotenv
 
-load_dotenv()  # Charge les variables depuis le fichier .env
+# Chargement des variables d'environnement
+load_dotenv()
+
 # --- Constants & Configuration ---
 ENV_BLOB_CONN = "BLOB_CONNECTION_STRING"
 ENV_BEARER = "BEARER_TOKEN"
 API_BASE = "https://bpi.api.datagalaxy.com/v2"
-VERSION_ID = os.environ.get("VERSION_ID", "7333a87f-1f0f-4cc7-8d81-fcc2b283d433")
+VERSION_ID = os.getenv("VERSION_ID", "7333a87f-1f0f-4cc7-8d81-fcc2b283d433")
 
 # --- Environment Helper ---
+
 def get_env(key: str) -> str:
-    val = os.environ.get(key)
+    val = os.getenv(key)
     if not val:
-        logging.warning(f"Env var '{key}' is not set at import time.")
+        logging.warning(f"Env var '{key}' is not set.")
         return ""
     return val
 
@@ -28,14 +32,18 @@ BLOB_CONN_STR = get_env(ENV_BLOB_CONN)
 BEARER_TOKEN = get_env(ENV_BEARER)
 
 # --- Blob Storage Utilities ---
+
 def get_blob_client() -> BlobServiceClient:
     return BlobServiceClient.from_connection_string(BLOB_CONN_STR)
+
 
 def read_csv_from_blob(container: str, blob_name: str,
                        sep: str = ';', encoding: str = 'cp1252') -> pd.DataFrame:
     client = get_blob_client().get_container_client(container)
     data = client.get_blob_client(blob_name).download_blob().readall()
+    logging.info(f"Loaded blob {blob_name} from container {container}.")
     return pd.read_csv(BytesIO(data), sep=sep, encoding=encoding)
+
 
 def write_csv_to_blob(container: str, df: pd.DataFrame,
                       sep: str = ';', encoding: str = 'cp1252') -> str:
@@ -44,9 +52,32 @@ def write_csv_to_blob(container: str, df: pd.DataFrame,
     buf = StringIO()
     df.to_csv(buf, index=False, sep=sep, encoding=encoding)
     client.upload_blob(name=filename, data=buf.getvalue().encode(encoding), overwrite=True)
+    logging.info(f"Uploaded blob {filename} to container {container}.")
     return filename
 
-# --- API Helpers ---
+# --- API Helper with Retry ---
+
+def api_get_with_retry(url: str, params: dict, headers: dict,
+                       retries: int = 3, wait: float = 1.0) -> dict:
+    """
+    Effectue un GET avec retry si échec.
+    """
+    for attempt in range(1, retries + 1):
+        try:
+            logging.debug(f"API GET {url} attempt {attempt}")
+            resp = requests.get(url, headers=headers, params=params)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException as e:
+            logging.warning(f"API call failed (attempt {attempt}/{retries}): {e}")
+            if attempt < retries:
+                time.sleep(wait)
+            else:
+                logging.error(f"API call to {url} failed after {retries} attempts.")
+                raise
+
+# --- Topic Fetching ---
+
 def fetch_all_topics() -> pd.DataFrame:
     url = f"{API_BASE}/structures"
     params = {
@@ -58,29 +89,19 @@ def fetch_all_topics() -> pd.DataFrame:
         'includeLinks': 'true'
     }
     headers = {'Authorization': f"Bearer {BEARER_TOKEN}"}
-    all_results = []
+    results = []
 
     while url:
-        logging.info(f"Fetching topics: {url}")
-        resp = requests.get(url, headers=headers, params=params)
-        resp.raise_for_status()
-        data = resp.json()
-        all_results.extend(data.get('results', []))
+        logging.info(f"Fetching topics from {url}")
+        data = api_get_with_retry(url, params, headers)
+        results.extend(data.get('results', []))
         url = data.get('next_page')
         params.clear()
 
-    return pd.json_normalize(all_results)
+    logging.info(f"Fetched {len(results)} topics in total.")
+    return pd.json_normalize(results)
 
-def add_referential_topics(df_topics: pd.DataFrame, df_ref: pd.DataFrame) -> pd.DataFrame:
-    df_topics['Code application'] = (
-        df_topics['technicalName'].str.split('_').str[1].str.upper()
-    )
-    df_ref_sel = df_ref[['trigramme', 'nom', 'train', 'agileTeam (valeur corrigée)']]
-    df = df_topics.merge(
-        df_ref_sel, left_on='Code application', right_on='trigramme', how='left'
-    )
-    df.rename(columns={'nom': 'Application', 'agileTeam (valeur corrigée)': 'équipe'}, inplace=True)
-    return df.drop(columns=['trigramme'])
+# --- Counting & Extraction Functions ---
 
 def count_data_fields(topic_id: str) -> int:
     url = f"{API_BASE}/fields"
@@ -89,88 +110,76 @@ def count_data_fields(topic_id: str) -> int:
     total = 0
 
     while url:
-        logging.info(f"Counting data fields: {url}")
-        resp = requests.get(url, headers=headers, params=params)
-        resp.raise_for_status()
-        data = resp.json()
-        for f in data.get('results', []):
-            attrs = f.get('attributes', {})
+        logging.debug(f"Counting data fields for topic {topic_id} at {url}")
+        data = api_get_with_retry(url, params, headers)
+        for field in data.get('results', []):
+            attrs = field.get('attributes', {})
             if attrs.get('Donnee Locale'): continue
-            if 'data' in f.get('path', '').lower().split('\\'):
+            if 'data' in field.get('path', '').lower().split('\\'):
                 total += 1
         url = data.get('next_page')
         params.clear()
 
     return total
 
+
 def count_glossary_alignments(topic_id: str) -> int:
     url = f"{API_BASE}/fields"
     params = {'parentId': topic_id, 'versionId': VERSION_ID, 'type': 'Field', 'includeLinks': 'true'}
     headers = {'Authorization': f"Bearer {BEARER_TOKEN}"}
     count = 0
-    key = 'BusinessTerm'
 
     while url:
-        logging.info(f"Counting glossary alignments: {url}")
-        resp = requests.get(url, headers=headers, params=params)
-        resp.raise_for_status()
-        data = resp.json()
-        for f in data.get('results', []):
-            if f.get('attributes', {}).get('Donnee Locale'): continue
-            for links in f.get('links', {}).values():
+        logging.debug(f"Counting glossary alignments for topic {topic_id}")
+        data = api_get_with_retry(url, params, headers)
+        for field in data.get('results', []):
+            if field.get('attributes', {}).get('Donnee Locale'): continue
+            for links in field.get('links', {}).values():
                 for link in links:
-                    if key in link.get('typePath', ''):
+                    if 'BusinessTerm' in link.get('typePath', ''):
                         count += 1
         url = data.get('next_page')
         params.clear()
 
     return count
 
+
 def extract_usage_parent_id_from_topic(row: pd.Series) -> str:
     raw = row.get('links.IsUsedBy')
     if isinstance(raw, str):
-        try: raw = json.loads(raw)
-        except Exception: return None
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
     if isinstance(raw, list) and raw:
         return raw[0].get('id')
     return None
+
 
 def count_usage_glossary_alignments(usage_id: str) -> int:
     if not usage_id:
         return 0
     url = f"{API_BASE}/usages"
-    params = {'parentId': usage_id, 'versionId': VERSION_ID, 'includeLinks': 'true', 'includeAttributes': 'true'}
+    params = {'parentId': usage_id, 'versionId': VERSION_ID,
+              'includeLinks': 'true', 'includeAttributes': 'true'}
     headers = {'Authorization': f"Bearer {BEARER_TOKEN}"}
     count = 0
-    key = 'BusinessTerm'
 
     while url:
-        logging.info(f"Counting usage alignments: {url}")
-        resp = requests.get(url, headers=headers, params=params)
-        resp.raise_for_status()
-        data = resp.json()
-        for u in data.get('results', []):
-            if u.get('attributes', {}).get('Donnee Locale'): continue
-            for links in u.get('links', {}).values():
+        logging.debug(f"Counting usage alignments for usage {usage_id}")
+        data = api_get_with_retry(url, params, headers)
+        for usage in data.get('results', []):
+            attrs = usage.get('attributes', {})
+            if attrs.get('Donnee Locale'): continue
+            for links in usage.get('links', {}).values():
                 for link in links:
-                    if key in link.get('typePath', ''):
+                    if 'BusinessTerm' in link.get('typePath', ''):
                         count += 1
         url = data.get('next_page')
         params.clear()
 
     return count
 
-def compute_alignment_counts(row: pd.Series) -> pd.Series:
-    topic_id = row['id']
-    total = count_data_fields(topic_id)
-    direct = count_glossary_alignments(topic_id)
-    usage_parent = extract_usage_parent_id_from_topic(row)
-    usage = count_usage_glossary_alignments(usage_parent)
-    return pd.Series({
-        'NombreChampsAAligner': total,
-        'NombreChampsAlignesDirectement': direct,
-        'NombreChampsAlignesUsage': usage
-    })
 
 def has_entity_field(topic_id: str) -> bool:
     url = f"{API_BASE}/fields"
@@ -178,17 +187,19 @@ def has_entity_field(topic_id: str) -> bool:
     headers = {'Authorization': f"Bearer {BEARER_TOKEN}"}
 
     while url:
-        resp = requests.get(url, headers=headers, params=params)
-        resp.raise_for_status()
-        for f in resp.json().get('results', []):
-            attrs = f.get('attributes', {})
-            if attrs.get('Donnee Locale') or attrs.get('status') == 'Obsolète': continue
-            if 'payload\\entity' in f.get('path', '').lower():
+        logging.debug(f"Checking entity field for topic {topic_id}")
+        data = api_get_with_retry(url, params, headers)
+        for field in data.get('results', []):
+            attrs = field.get('attributes', {})
+            if attrs.get('Donnee Locale') or attrs.get('status') == 'Obsolète':
+                continue
+            if 'payload\\entity' in field.get('path', '').lower():
                 return True
-        url = resp.json().get('next_page')
+        url = data.get('next_page')
         params.clear()
 
     return False
+
 
 def get_portee(path: str) -> str:
     parts = path.split('\\')
@@ -198,13 +209,64 @@ def get_portee(path: str) -> str:
             return segs[2]
     return ''
 
+# --- Data Enrichment ---
+
+def add_referential_topics(df_topics: pd.DataFrame, df_ref: pd.DataFrame) -> pd.DataFrame:
+    # Calcul du code application
+    df_topics['Code application'] = df_topics['technicalName'].apply(
+        lambda tn: tn.split('_')[3].upper() if tn.startswith('prd_kif_') else tn.split('_')[1].upper()
+    )
+    logging.info("Applied custom logic for Code application.")
+
+    # Attribution du type de topic
+    df_topics['attributes.Type Topic'] = df_topics['technicalName'].apply(
+        lambda tn: 'reprise' if '_reprise_' in tn else ('technique' if '_technical_' in tn else tn)
+    )
+    logging.info("Set Type Topic based on naming rules.")
+
+    # Jointure référentiel
+    df_ref_sel = df_ref[['trigramme', 'nom', 'train', 'agileTeam (valeur corrigée)']]
+    df = df_topics.merge(
+        df_ref_sel,
+        left_on='Code application', right_on='trigramme', how='left'
+    )
+    df.rename(columns={'nom': 'Application', 'agileTeam (valeur corrigée)': 'équipe'}, inplace=True)
+    logging.info("Merged with reference dataframe.")
+    return df.drop(columns=['trigramme'])
+
+# --- Compute and Finalize ---
+
+def compute_alignment_counts(row: pd.Series) -> pd.Series:
+    try:
+        total = count_data_fields(row['id'])
+        direct = count_glossary_alignments(row['id'])
+        usage = count_usage_glossary_alignments(
+            extract_usage_parent_id_from_topic(row)
+        )
+        return pd.Series({
+            'NombreChampsAAligner': total,
+            'NombreChampsAlignesDirectement': direct,
+            'NombreChampsAlignesUsage': usage
+        })
+    except Exception as e:
+        logging.warning(f"Alignment count failed for {row['id']}: {e}")
+        return pd.Series({
+            'NombreChampsAAligner': 0,
+            'NombreChampsAlignesDirectement': 0,
+            'NombreChampsAlignesUsage': 0
+        })
+
+
 def generate_final_output_df(df: pd.DataFrame) -> pd.DataFrame:
     df_counts = df.apply(compute_alignment_counts, axis=1)
     df = pd.concat([df, df_counts], axis=1)
+
+    # Flag entité vs fonctionnel
     df['Flag topic entité ?'] = df['id'].apply(
         lambda tid: 'Topic Entité' if has_entity_field(tid) else 'Topic Fonctionnel'
     )
 
+    # Assemblage du dataframe de sortie
     df_out = pd.DataFrame({
         'Train': df['train'],
         'Application': df['Application'],
@@ -221,14 +283,12 @@ def generate_final_output_df(df: pd.DataFrame) -> pd.DataFrame:
         'Description': df['attributes.description'],
         '% de documentation': df['attributes.% de documentation'],
         'Nombre de données de la payload à aligner': df['NombreChampsAAligner'],
-        'Nombre de données alignés au glossaire': df[['NombreChampsAlignesDirectement',
-                                                     'NombreChampsAlignesUsage']].max(axis=1)
+        'Nombre de données alignés au glossaire': df[['NombreChampsAlignesDirectement', 'NombreChampsAlignesUsage']].max(axis=1)
     })
 
     df_out['% lineage glossaire'] = (
         df_out['Nombre de données alignés au glossaire']
-        / df_out['Nombre de données de la payload à aligner']
-        * 100
+        / df_out['Nombre de données de la payload à aligner'] * 100
     ).fillna(0)
 
     bins = [0, 0.000001, 80, 100, float('inf')]
@@ -242,39 +302,53 @@ def generate_final_output_df(df: pd.DataFrame) -> pd.DataFrame:
         df_out['% lineage glossaire'], bins=bins, labels=labels, right=False
     )
 
+    logging.info("Generated final output dataframe.")
     return df_out
 
-def topicsAnalytics():
-    logging.info("Starting topic analytics.")
-    source = "sources"
-    ref_blob = "ref/ref_application.csv"
-    target = "analytics"
+# --- Main Analytics Function ---
 
+def topicsAnalytics():
+    logging.info("Starting topics analytics process.")
+    source, ref_blob, target = "sources", "ref/ref_application.csv", "analytics"
+
+    # Chargement du référentiel
     try:
         df_ref = read_csv_from_blob(source, ref_blob)
-        logging.info("Reference data loaded.")
-    except Exception as err:
-        logging.error(f"Reference load error: {err}")
+    except Exception as e:
+        logging.error(f"Reference load error: {e}")
         return "Reference load failed"
 
+    # Fetch topics
     try:
         df_topics = fetch_all_topics()
-        df_enriched = add_referential_topics(df_topics, df_ref)
-        df_filtered = df_enriched[df_enriched['technicalName'].str.endswith('ini')]
-        df_final = generate_final_output_df(df_filtered)
-    except Exception as err:
-        logging.error(f"Processing error: {err}")
+    except Exception as e:
+        logging.error(f"Fetching topics failed: {e}")
+        return "Fetching topics failed"
+
+    # Enrichissement et filtrage
+    df_enriched = add_referential_topics(df_topics, df_ref)
+    df_filtered = df_enriched[df_enriched['technicalName'].str.endswith('ini')]
+    logging.info(f"Filtered to {len(df_filtered)} topics ending with 'ini'.")
+
+    # Génération de la sortie
+    try:
+        df_output = generate_final_output_df(df_filtered)
+    except Exception as e:
+        logging.error(f"Processing failed: {e}")
         return "Processing failed"
 
+    # Écriture dans Blob
     try:
-        name = write_csv_to_blob(target, df_final)
-        msg = f"Saved CSV to '{target}' as {name}"
+        filename = write_csv_to_blob(target, df_output)
+        msg = f"Saved CSV to '{target}' as {filename}"
         logging.info(msg)
         return msg
-    except Exception as err:
-        logging.error(f"Upload error: {err}")
+    except Exception as e:
+        logging.error(f"Upload error: {e}")
         return "Upload failed"
 
+
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    print(topicsAnalytics())
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s')
+    result = topicsAnalytics()
+    print(result)
