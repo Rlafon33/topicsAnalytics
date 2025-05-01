@@ -2,7 +2,7 @@ name: Run Topic Analytics
 
 on:
   schedule:
-    - cron: '0 5 * * 1-5'  # Tous les jours de la semaine (lundi à vendredi) à 9h UTC
+    - cron: '0 6 * * 1-5'  # Tous les jours de la semaine (lundi à vendredi) à 9h UTC
   workflow_dispatch:     # Permet aussi de le lancer manuellement depuis GitHub
 
 jobs:
