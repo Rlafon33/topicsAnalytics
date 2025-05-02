@@ -9,6 +9,8 @@ import pandas as pd
 import requests
 from azure.storage.blob import BlobServiceClient
 from dotenv import load_dotenv
+from datetime import date
+
 
 # Chargement des variables d'environnement
 load_dotenv()
@@ -45,13 +47,34 @@ def read_csv_from_blob(container: str, blob_name: str,
     return pd.read_csv(BytesIO(data), sep=sep, encoding=encoding)
 
 
-def write_csv_to_blob(container: str, df: pd.DataFrame,
-                      sep: str = ';', encoding: str = 'cp1252') -> str:
+def write_csv_to_blob(
+    container: str,
+    df: pd.DataFrame,
+    sep: str = ';',
+    encoding: str = 'cp1252',
+    filename: str = None
+) -> str:
+    """
+    Enregistre le DataFrame `df` au format CSV dans le container Blob donné.
+    Si `filename` est fourni, l’utilise comme nom de fichier, sinon génère
+    un nom par défaut basé sur la date UTC du jour (YYYYMMDD_TopicsEnrichis.csv).
+    """
     client = get_blob_client().get_container_client(container)
-    filename = f"{datetime.utcnow():%Y%m%d}_TopicsEnrichis.csv"
+
+    # Détermination du nom de fichier
+    if filename is None:
+        filename = f"{datetime.utcnow():%Y%m%d}_TopicsEnrichis.csv"
+
+    # Sérialisation du DataFrame en CSV dans un buffer mémoire
     buf = StringIO()
     df.to_csv(buf, index=False, sep=sep, encoding=encoding)
-    client.upload_blob(name=filename, data=buf.getvalue().encode(encoding), overwrite=True)
+
+    # Upload du buffer vers Azure Blob
+    client.upload_blob(
+        name=filename,
+        data=buf.getvalue().encode(encoding),
+        overwrite=True
+    )
     logging.info(f"Uploaded blob {filename} to container {container}.")
     return filename
 
@@ -79,6 +102,7 @@ def api_get_with_retry(url: str, params: dict, headers: dict,
 # --- Topic Fetching ---
 
 def fetch_all_topics() -> pd.DataFrame:
+    
     url = f"{API_BASE}/structures"
     params = {
         'versionId': VERSION_ID,
@@ -191,7 +215,7 @@ def has_entity_field(topic_id: str) -> bool:
         data = api_get_with_retry(url, params, headers)
         for field in data.get('results', []):
             attrs = field.get('attributes', {})
-            if attrs.get('Donnee Locale') or attrs.get('status') == 'Obsolète':
+            if attrs.get('Donnee Locale') or attrs.get('status') == 'Obsolete':
                 continue
             if 'payload\\entity' in field.get('path', '').lower():
                 return True
@@ -213,14 +237,23 @@ def get_portee(path: str) -> str:
 
 def add_referential_topics(df_topics: pd.DataFrame, df_ref: pd.DataFrame) -> pd.DataFrame:
     # Calcul du code application
-    df_topics['Code application'] = df_topics['technicalName'].apply(
-        lambda tn: tn.split('_')[3].upper() if tn.startswith('prd_kif_') else tn.split('_')[1].upper()
-    )
-    logging.info("Applied custom logic for Code application.")
+    def extract_code_application(tn: str) -> str:
+        if tn.startswith('prd_kif_'):
+            parts = tn.split('_')
+            if len(parts) > 3 and parts[3].isalpha() and len(parts[3]) == 3:
+                return parts[3].upper()
+            else:
+                return "KIF"
+        else:
+            return tn.split('_')[1].upper()
+    
+    df_topics['Code application'] = df_topics['technicalName'].apply(extract_code_application)
+    df_topics['Code producteur'] = df_topics['technicalName'].apply(lambda tn: tn.split('_')[1].upper())
+    logging.info("Applied custom logic for Code application and Code producteur.")
 
     # Attribution du type de topic
     df_topics['attributes.Type Topic'] = df_topics['technicalName'].apply(
-        lambda tn: 'reprise' if '_reprise_' in tn else ('technique' if '_technical_' in tn else tn)
+        lambda tn: 'Reprise' if '_reprise_' in tn else ('Technique' if '_technical_' in tn else 'Public')
     )
     logging.info("Set Type Topic based on naming rules.")
 
@@ -256,8 +289,26 @@ def compute_alignment_counts(row: pd.Series) -> pd.Series:
             'NombreChampsAlignesUsage': 0
         })
 
+def load_latest_histo_paths(container_name: str, prefix: str = "histo/") -> set:
+    """
+    Récupère le set des Path du dernier fichier historique dans le container donné,
+    en ne listant que les blobs sous le préfixe `prefix`.
+    """
+    container = get_blob_client().get_container_client(container_name)
+    # ne lister que les blobs commençant par "histo/"
+    blobs = sorted(
+        container.list_blobs(name_starts_with=prefix),
+        key=lambda b: b.name
+    )
+    if not blobs:
+        return set()
 
-def generate_final_output_df(df: pd.DataFrame) -> pd.DataFrame:
+    latest_blob_name = blobs[-1].name  # ex : "histo/202505_histoTopics.csv"
+    data = container.get_blob_client(latest_blob_name).download_blob().readall()
+    df_old = pd.read_csv(BytesIO(data), sep=';', encoding='cp1252')
+    return set(df_old['Path'])
+
+def generate_final_output_df(df: pd.DataFrame, old_paths: set = None) -> pd.DataFrame:
     df_counts = df.apply(compute_alignment_counts, axis=1)
     df = pd.concat([df, df_counts], axis=1)
 
@@ -271,6 +322,7 @@ def generate_final_output_df(df: pd.DataFrame) -> pd.DataFrame:
         'Train': df['train'],
         'Application': df['Application'],
         'Code application': df['Code application'],
+        'Code producteur': df['Code producteur'],
         'Equipe': df.get('équipe', 'Nextgen'),
         'Path': df['path'],
         'Nom du topic': df['name'],
@@ -293,14 +345,19 @@ def generate_final_output_df(df: pd.DataFrame) -> pd.DataFrame:
 
     bins = [0, 0.000001, 80, 100, float('inf')]
     labels = [
-        '0-Lineage fonctionnel & aligné au MOM inexistant',
-        '1-Lineage fonctionnel & aligné au MOM partiel :<80%',
-        '2-Lineage fonctionnel & aligné au MOM à compléter :<100%',
-        '3-Lineage fonctionnel & aligné au MOM complet'
+        '0-Lineage fonctionnel & aligné au glossaire inexistant',
+        '1-Lineage fonctionnel & aligné au glossaire partiel :<80%',
+        '2-Lineage fonctionnel & aligné au glossaire à compléter :<100%',
+        '3-Lineage fonctionnel & aligné au glossaire complet'
     ]
     df_out['Classe de pourcentage'] = pd.cut(
         df_out['% lineage glossaire'], bins=bins, labels=labels, right=False
     )
+    if old_paths is not None:
+        df_out['Nouveau'] = df_out['Path'].isin(old_paths).map({True: 'Non', False: 'Oui'})
+        logging.info(f"Flag 'Nouveau' ajouté : {df_out['Nouveau'].value_counts().to_dict()}")
+    else:
+        df_out['Nouveau'] = 'Oui'  # par défaut si pas d'historique
 
     logging.info("Generated final output dataframe.")
     return df_out
@@ -310,14 +367,22 @@ def generate_final_output_df(df: pd.DataFrame) -> pd.DataFrame:
 def topicsAnalytics():
     logging.info("Starting topics analytics process.")
     source, ref_blob, target = "sources", "ref/ref_application.csv", "analytics"
-
     # Chargement du référentiel
     try:
         df_ref = read_csv_from_blob(source, ref_blob)
     except Exception as e:
         logging.error(f"Reference load error: {e}")
         return "Reference load failed"
-
+    try:
+        logging.info("Starting load params.")
+        df_obeya = read_csv_from_blob("sources", "params/Obeya.csv", sep=';', encoding='utf-8')
+        obeya_dates = df_obeya.iloc[:, 0].astype(str).tolist()
+        today_str = datetime.today().strftime('%Y%m%d')
+        logging.info(f"Date du jour : {today_str}, Dates Obeya : {obeya_dates}")
+    except Exception as e:
+        logging.warning(f"Erreur lecture Obeya.csv : {str(e)}")
+        obeya_dates = []
+    
     # Fetch topics
     try:
         df_topics = fetch_all_topics()
@@ -332,7 +397,8 @@ def topicsAnalytics():
 
     # Génération de la sortie
     try:
-        df_output = generate_final_output_df(df_filtered)
+        old_paths = load_latest_histo_paths("sources", prefix="histo/")
+        df_output = generate_final_output_df(df_filtered, old_paths=old_paths)
     except Exception as e:
         logging.error(f"Processing failed: {e}")
         return "Processing failed"
@@ -342,10 +408,18 @@ def topicsAnalytics():
         filename = write_csv_to_blob(target, df_output)
         msg = f"Saved CSV to '{target}' as {filename}"
         logging.info(msg)
-        return msg
     except Exception as e:
         logging.error(f"Upload error: {e}")
         return "Upload failed"
+    
+    if today_str in obeya_dates:
+        try:
+            df_histo = pd.DataFrame(df_output["Path"])
+            histo_filename = datetime.today().strftime('%Y%m') + "_histoTopics.csv"
+            write_csv_to_blob("sources/histo", df_histo, sep=';', encoding='cp1252', filename=histo_filename)
+            logging.info(f"Fichier historique généré : sources/histo/{histo_filename}")
+        except Exception as e:
+            logging.warning(f"Erreur lors de la génération du fichier histo : {str(e)}")
 
 
 if __name__ == "__main__":
