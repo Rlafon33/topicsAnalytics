@@ -86,8 +86,8 @@ def api_get_with_retry(url: str, params: dict, headers: dict,
     Effectue un GET avec retry si échec.
     """
     for attempt in range(1, retries + 1):
+        logging.info(f"API GET call: URL={url}, params={params}, attempt={attempt}")
         try:
-            logging.debug(f"API GET {url} attempt {attempt}")
             resp = requests.get(url, headers=headers, params=params)
             resp.raise_for_status()
             return resp.json()
@@ -386,6 +386,7 @@ def topicsAnalytics():
     # Fetch topics
     try:
         df_topics = fetch_all_topics()
+     #   df_topics = df_topics.head(30)
     except Exception as e:
         logging.error(f"Fetching topics failed: {e}")
         return "Fetching topics failed"
