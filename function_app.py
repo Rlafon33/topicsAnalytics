@@ -393,7 +393,7 @@ def topicsAnalytics():
 
     # Enrichissement et filtrage
     df_enriched = add_referential_topics(df_topics, df_ref)
-    df_filtered = df_enriched[df_enriched['technicalName'].str.endswith('ini')]
+    df_filtered = df_enriched[df_enriched['technicalName'].str.contains('_ini', na=False)]
     logging.info(f"Filtered to {len(df_filtered)} topics ending with 'ini'.")
 
     # Génération de la sortie
